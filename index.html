@@ -1,0 +1,665 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Clay Shaper: Pottery Studio</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { width:100%; height:100%; overflow:hidden; background:#2b1d16; font-family:'Trebuchet MS','Segoe UI',Verdana,sans-serif; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; touch-action:none; background:#f7e8d0; }
+  .sr { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game" width="480" height="800" aria-label="Clay Shaper: Pottery Studio game"></canvas></div>
+<p class="sr">Clay Shaper: Pottery Studio. Drag the clay on the wheel to match the dashed target shape, then tap Fire It to serve the customer.</p>
+<script>
+'use strict';
+/* =====================================================================
+   Clay Shaper: Pottery Studio — an ORIGINAL game.
+   Mechanics only inspired by clay/pottery shaping. No copied art, code,
+   names, characters or assets from any existing game. All titles,
+   characters, art and music are original and procedurally generated.
+   ===================================================================== */
+
+const cv = document.getElementById('game');
+const ctx = cv.getContext('2d');
+const W = 480, H = 800;
+
+/* ---------------- utils ---------------- */
+const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+const lerp = (a,b,t)=>a+(b-a)*t;
+function mulberry(seed){ let s=seed>>>0; return ()=>{ s|=0; s=s+0x6D2B79F5|0; let t=Math.imul(s^s>>>15,1|s); t=t+Math.imul(t^t>>>7,61|t)^t; return ((t^t>>>14)>>>0)/4294967296; }; }
+
+/* ---------------- audio (synthesized, original) ---------------- */
+const AudioSys = {
+  ctx:null, master:null, musicGain:null, muted:false, musicTimer:null, step:0,
+  init(){
+    if(this.ctx) return;
+    try{
+      this.ctx = new (window.AudioContext||window.webkitAudioContext)();
+      this.master = this.ctx.createGain(); this.master.gain.value = 0.5; this.master.connect(this.ctx.destination);
+      this.musicGain = this.ctx.createGain(); this.musicGain.gain.value = 0.16; this.musicGain.connect(this.master);
+    }catch(e){ /* audio unavailable: game still works */ }
+  },
+  resume(){ if(this.ctx && this.ctx.state==='suspended') this.ctx.resume(); },
+  tone(freq,dur,type,vol,when,slideTo){
+    if(!this.ctx||this.muted) return;
+    const t = this.ctx.currentTime + (when||0);
+    const o = this.ctx.createOscillator(), g = this.ctx.createGain();
+    o.type=type||'sine'; o.frequency.setValueAtTime(freq,t);
+    if(slideTo) o.frequency.exponentialRampToValueAtTime(slideTo,t+dur);
+    g.gain.setValueAtTime(0.0001,t);
+    g.gain.exponentialRampToValueAtTime(vol||0.25,t+0.015);
+    g.gain.exponentialRampToValueAtTime(0.0001,t+dur);
+    o.connect(g); g.connect(this.master); o.start(t); o.stop(t+dur+0.05);
+  },
+  squish(){ this.tone(180,0.12,'sine',0.18,0,90); },
+  click(){ this.tone(660,0.07,'triangle',0.18); },
+  coin(){ this.tone(880,0.1,'triangle',0.22); this.tone(1318,0.18,'triangle',0.2,0.09); },
+  success(){ [523,659,784,1047].forEach((f,i)=>this.tone(f,0.22,'triangle',0.22,i*0.09)); },
+  fail(){ this.tone(220,0.3,'sawtooth',0.12,0,110); this.tone(165,0.35,'sawtooth',0.1,0.12,82); },
+  pop(){ this.tone(440,0.08,'square',0.1,0,660); },
+  // Original gentle pentatonic loop (C major pentatonic), scheduled per bar.
+  melody:[523,587,659,784,880,784,659,587, 523,659,784,880,784,659,587,523,
+          440,523,587,659,587,523,440,392, 523,587,659,784,659,587,523,440],
+  startMusic(){
+    if(!this.ctx||this.musicTimer) return;
+    this.step=0;
+    this.musicTimer=setInterval(()=>{
+      if(this.muted||!this.ctx) return;
+      const f=this.melody[this.step%this.melody.length];
+      const t=this.ctx.currentTime;
+      const o=this.ctx.createOscillator(), g=this.ctx.createGain();
+      o.type='triangle'; o.frequency.value=f;
+      g.gain.setValueAtTime(0.0001,t); g.gain.exponentialRampToValueAtTime(0.5,t+0.03);
+      g.gain.exponentialRampToValueAtTime(0.0001,t+0.42);
+      o.connect(g); g.connect(this.musicGain); o.start(t); o.stop(t+0.45);
+      // soft bass root every 4 steps
+      if(this.step%4===0){ const b=this.ctx.createOscillator(), bg=this.ctx.createGain();
+        b.type='sine'; b.frequency.value=(this.step%16<8)?131:98;
+        bg.gain.setValueAtTime(0.0001,t); bg.gain.exponentialRampToValueAtTime(0.35,t+0.05);
+        bg.gain.exponentialRampToValueAtTime(0.0001,t+0.9);
+        b.connect(bg); bg.connect(this.musicGain); b.start(t); b.stop(t+0.95); }
+      this.step++;
+    }, 300);
+  },
+  stopMusic(){ if(this.musicTimer){ clearInterval(this.musicTimer); this.musicTimer=null; } },
+  toggleMute(){ this.muted=!this.muted; if(this.master) this.master.gain.value=this.muted?0:0.5; return this.muted; }
+};
+
+/* ---------------- shape profiles ----------------
+   t: 0 = bottom of pot, 1 = rim. Returns radius factor 0..1 (× maxR). */
+const SHAPES = {
+  bowl:    t => 0.45 + 0.55*Math.pow(t,1.4),
+  cup:     t => 0.62 + 0.18*Math.sin(t*Math.PI) + 0.10*t,
+  mug:     t => 0.66 + 0.14*Math.sin(t*Math.PI*2)*0.3 + 0.08*t,
+  vase:    t => 0.42 + 0.58*Math.pow(Math.sin(t*Math.PI*0.85),1.2) * (t<0.85?1:0.55) - (t>0.85? (t-0.85)*1.6:0),
+  jar:     t => 0.5 + 0.5*Math.sin(t*Math.PI*0.9) - (t>0.9?(t-0.9)*2.2:0),
+  bottle:  t => t<0.55 ? 0.55+0.45*Math.sin(t/0.55*Math.PI*0.5) : 0.98 - (t-0.55)*1.55,
+  plate:   t => 0.35 + 0.65*Math.pow(t,2.2),
+  planter: t => 0.5 + 0.5*Math.pow(t,1.1),
+  goblet:  t => t<0.25 ? 0.42+0.3*(t/0.25) : t<0.6 ? 0.72-0.35*((t-0.25)/0.35) : 0.37+0.55*((t-0.6)/0.4),
+  pitcher: t => 0.5 + 0.42*Math.sin(t*Math.PI*0.8) + (t>0.8? (t-0.8)*0.9:0),
+  urn:     t => 0.4 + 0.6*Math.pow(Math.sin(t*Math.PI*0.92),1.1),
+  ramen:   t => 0.4 + 0.6*Math.pow(t,1.2) + 0.08*Math.sin(t*Math.PI*3),
+  lamp:    t => 0.55 + 0.4*Math.sin(t*Math.PI) - (t>0.85?(t-0.85)*1.2:0),
+  dish:    t => 0.3 + 0.7*Math.pow(t,2.6),
+  grandvase:t=> 0.38 + 0.62*Math.pow(Math.sin(t*Math.PI*0.8),1.0) - (t>0.8?(t-0.8)*1.4:0),
+};
+
+/* ---------------- 20 customer orders ----------------
+   Original customers, requests and shapes. Difficulty ramps:
+   points 7→11, pass mark 65→85, time 90s→50s, rim wobble grows. */
+const ORDERS = [
+  {name:'Mia Brook',    item:'Cosy Soup Bowl',   shape:'bowl',    say:'A wide, friendly bowl for my tomato soup, please!', tip:'Drag the clay outward near the top.'},
+  {name:'Leo Finch',    item:'Morning Cup',      shape:'cup',     say:'A simple cup for my morning cocoa.', tip:'Keep the sides almost straight.'},
+  {name:'Nora Vale',    item:'Garden Planter',   shape:'planter', say:'A planter that flares out for my herbs.', tip:'Widen it steadily toward the rim.'},
+  {name:'Sam Ortiz',    item:'Sturdy Mug',       shape:'mug',     say:'A chunky mug that survives my desk.', tip:'A mug is straight with a gentle belly.'},
+  {name:'Ivy Chen',     item:'Tea Vase',         shape:'vase',    say:'A vase with a slim neck for one rose.', tip:'Pinch the top in, keep the belly round.'},
+  {name:'Omar Haddad',  item:'Olive Oil Jar',    shape:'jar',     say:'A round jar with a narrow mouth, for oil.', tip:'Round belly, then tuck the mouth in.'},
+  {name:'Ada Kowalski', item:'Dinner Plate',     shape:'plate',   say:'A flat, wide plate for Sunday roasts.', tip:'Very wide at the top, narrow at the base.'},
+  {name:'Ben Marsh',    item:'Water Bottle',     shape:'bottle',  say:'A tall bottle with a long neck.', tip:'Tall body, then a long slim neck.'},
+  {name:'Zoe Lark',     item:'Party Goblet',     shape:'goblet',  say:'A goblet — wide foot, slim stem, wide cup!', tip:'Wide at both ends, slim in the middle.'},
+  {name:'Max Reed',     item:'Milk Pitcher',     shape:'pitcher', say:'A pitcher with a little pouring lip.', tip:'Round body with a small flare at the lip.'},
+  {name:'Luna Park',    item:'Ramen Bowl',       shape:'ramen',   say:'A deep ramen bowl, please — extra noodles!', tip:'Deep and wide, with a rippled rim.'},
+  {name:'Kai Tanaka',   item:'Flower Urn',       shape:'urn',     say:'An elegant urn for the hallway.', tip:'A smooth, full curve top to bottom.'},
+  {name:'Rosa Diaz',    item:'Oil Lamp',         shape:'lamp',    say:'A round lamp for festival night.', tip:'Round body, small neck on top.'},
+  {name:'Eli Grant',    item:'Serving Dish',     shape:'dish',    say:'A shallow serving dish for salads.', tip:'Shallow and wide — like a wide bowl.'},
+  {name:'Tara Singh',   item:'Grand Vase',       shape:'grandvase',say:'A grand vase for the hotel lobby!', tip:'Big belly, slim neck, tall and proud.'},
+  {name:'Finn Doyle',   item:'Tall Bottle',      shape:'bottle',  say:'A taller bottle than last time — make it fancy.', tip:'Long neck, and a wavy rim this time.'},
+  {name:'June Park',    item:'Festival Vase',    shape:'vase',    say:'A vase with a rippled rim for the festival.', tip:'Pinch the neck, ripple the rim.'},
+  {name:'Hugo Weiss',   item:'Royal Goblet',     shape:'goblet',  say:'A royal goblet — the stem must be extra slim.', tip:'Slim stem, wide foot and cup.'},
+  {name:'Sara Lind',    item:'Heirloom Urn',     shape:'urn',     say:'An heirloom urn, perfect curves, no wobbles!', tip:'Smooth curves, and mind the wobble.'},
+  {name:'Theo Ash',     item:'Masterpiece Vase', shape:'grandvase',say:'The masterpiece! A grand vase, flawless.', tip:'Your hardest customer yet — take your time.'},
+];
+ORDERS.forEach((o,i)=>{
+  o.points = 7 + Math.min(4, Math.floor(i/5));          // 7,7,7,7,7,8,8,8,8,8,9,9,9,9,9,10,10,10,10,10... capped 11
+  if(i>=15) o.points = 11; if(i>=10&&i<15) o.points = 9;
+  o.pass = 65 + Math.min(20, i);                          // 65% → 85%
+  o.time = Math.max(50, 90 - i*2);                        // 90s → 52s
+  o.wobble = i<5?0 : i<10?0.06 : i<15?0.12 : 0.18;        // rim ripple grows
+  o.coins = 10 + i*2;                                     // base coin value
+});
+
+/* ---------------- game state ---------------- */
+const G = {
+  screen:'menu',           // menu | howto | play | paused | leveldone | gameover | win
+  level:0,                 // 0-based index into ORDERS
+  score:0, coins:0, hearts:3,
+  stars:[],                // stars per completed level
+  radii:[], target:[],     // profile radii (px), bottom→top
+  n:7, timeLeft:0, timeMax:90,
+  dragging:false, lastX:0, lastSquish:0,
+  accuracy:0, flash:0, flashText:'',
+  sparkles:[], result:null, // {acc, stars, earned, passed}
+  shake:0,
+};
+const CX = 240, BASE_Y = 648, TOP_Y = 218, MAXR = 148, MINR = 22;
+const CLAY_COLORS = ['#c96f3f','#b85a30','#d98a52','#a34d28'];
+
+function targetRadius(i,n,shape,wobble,seed){
+  const t = n===1?1:i/(n-1);
+  let f = SHAPES[shape](t);
+  if(wobble>0){
+    const rnd = mulberry(seed*31+i*7);
+    f += Math.sin(t*Math.PI*4 + seed)*wobble*0.5 + (rnd()-0.5)*wobble*0.4;
+  }
+  return clamp(f,0.12,1)*MAXR;
+}
+function startLevel(idx){
+  const o = ORDERS[idx];
+  G.level = idx; G.n = o.points;
+  G.timeMax = o.time; G.timeLeft = o.time;
+  const rnd = mulberry(1234 + idx*97);
+  G.target = [];
+  for(let i=0;i<o.points;i++) G.target.push(targetRadius(i,o.points,o.shape,o.wobble,idx+3));
+  // starting clay: a plain narrow cylinder, slightly lumpy — far enough
+  // from every target that firing untouched cannot pass
+  G.radii = [];
+  for(let i=0;i<o.points;i++){
+    const t=i/(o.points-1);
+    G.radii.push(clamp(52 + Math.sin(t*Math.PI)*10 + (rnd()-0.5)*20, MINR, MAXR));
+  }
+  G.dragging=false; G.accuracy=computeAccuracy(); G.sparkles=[]; G.shake=0;
+  G.screen='play';
+}
+function computeAccuracy(){
+  if(!G.radii.length) return 0;
+  let err=0;
+  for(let i=0;i<G.n;i++) err += Math.abs(G.radii[i]-G.target[i])/(MAXR-MINR);
+  // ×1.25 sensitivity: a plain starting cylinder scores ~50%, so the player
+  // must actually shape the clay — firing untouched should not pass.
+  return clamp(Math.round(100 - (err/G.n)*100*1.25),0,100);
+}
+function pointY(i){ return BASE_Y - (i/(G.n-1))*(BASE_Y-TOP_Y); }
+function pointScreen(i){ return {x:CX+G.radii[i], y:pointY(i)}; }
+
+function submitPot(){
+  if(G.screen!=='play') return;
+  const o = ORDERS[G.level];
+  const acc = computeAccuracy();
+  G.accuracy = acc;
+  const passed = acc >= o.pass;
+  if(passed){
+    const stars = acc>=92?3 : acc>=80?2 : 1;
+    const earned = Math.round(o.coins * (0.5 + acc/100));
+    G.coins += earned; G.score += acc*10 + stars*50;
+    G.stars[G.level]=stars;
+    G.result={acc,stars,earned,passed:true};
+    G.flash=1; G.flashText='Beautiful!';
+    AudioSys.success(); AudioSys.coin();
+    burstSparkles();
+    G.screen='leveldone';
+  }else{
+    G.hearts--;
+    G.result={acc,stars:0,earned:0,passed:false};
+    G.flash=1; G.flashText='Not quite…';
+    AudioSys.fail(); G.shake=12;
+    G.screen = G.hearts<=0 ? 'gameover' : 'leveldone';
+  }
+}
+function burstSparkles(){
+  for(let i=0;i<40;i++){
+    G.sparkles.push({x:CX+(Math.random()-0.5)*260, y:BASE_Y-Math.random()*420,
+      vx:(Math.random()-0.5)*2.4, vy:-Math.random()*2.6-0.6, life:1, s:2+Math.random()*4,
+      c:['#ffd94d','#ff9d5c','#fff3c4','#c96f3f'][i%4]});
+  }
+}
+function retryLevel(){ startLevel(G.level); }
+function nextLevel(){
+  if(G.level+1>=ORDERS.length){ G.screen='win'; AudioSys.success(); }
+  else startLevel(G.level+1);
+}
+function restartGame(){ G.score=0; G.coins=0; G.hearts=3; G.stars=[]; startLevel(0); }
+
+/* ---------------- input ---------------- */
+function canvasPos(e){
+  const r = cv.getBoundingClientRect();
+  const x = (e.clientX-r.left) * (W/r.width);
+  const y = (e.clientY-r.top) * (H/r.height);
+  return {x,y};
+}
+function applyDrag(x,y,dx){
+  // find nearest profile height, push/pull radius with falloff to neighbours
+  let best=0, bd=1e9;
+  for(let i=0;i<G.n;i++){ const d=Math.abs(y-pointY(i)); if(d<bd){bd=d;best=i;} }
+  if(bd>70) return false;
+  const weights=[1,0.55,0.25];
+  for(let k=-2;k<=2;k++){
+    const j=best+k; if(j<0||j>=G.n) continue;
+    G.radii[j]=clamp(G.radii[j]+dx*0.6*weights[Math.abs(k)], MINR, MAXR);
+  }
+  G.accuracy=computeAccuracy();
+  const now=performance.now();
+  if(now-G.lastSquish>90){ G.lastSquish=now; AudioSys.squish(); }
+  return true;
+}
+cv.addEventListener('pointerdown', e=>{
+  e.preventDefault();
+  AudioSys.init(); AudioSys.resume(); AudioSys.startMusic();
+  render(); // refresh BUTTONS synchronously: on slow devices a frame may
+            // not have run since the last screen change, leaving stale hits
+  const p=canvasPos(e);
+  handleTap(p.x,p.y);
+  if(G.screen==='play'){
+    // drag starts anywhere on/near the clay
+    const onClay = Math.abs(p.x-CX) < MAXR+40 && p.y>TOP_Y-30 && p.y<BASE_Y+30;
+    if(onClay){ G.dragging=true; G.lastX=p.x; applyDrag(p.x,p.y,0); }
+  }
+  cv.setPointerCapture(e.pointerId);
+});
+cv.addEventListener('pointermove', e=>{
+  if(!G.dragging||G.screen!=='play') return;
+  const p=canvasPos(e);
+  const dx=p.x-G.lastX; G.lastX=p.x;
+  applyDrag(p.x,p.y,dx);
+});
+function endDrag(){ G.dragging=false; }
+cv.addEventListener('pointerup', endDrag);
+cv.addEventListener('pointercancel', endDrag);
+
+/* ---------------- buttons (canvas-drawn, hit-tested) ---------------- */
+let BUTTONS=[]; // {x,y,w,h,label,action}
+function btn(x,y,w,h,label,action){ BUTTONS.push({x,y,w,h,label,action}); return {x,y,w,h,label,action}; }
+function inBtn(b,x,y){ return x>=b.x&&x<=b.x+b.w&&y>=b.y&&y<=b.y+b.h; }
+
+function handleTap(x,y){
+  // check current screen's buttons first
+  for(const b of BUTTONS){ if(inBtn(b,x,y)){ AudioSys.click(); b.action(); return true; } }
+  return false;
+}
+
+/* ---------------- drawing ---------------- */
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath(); }
+function drawButton(b,bg,fg){
+  ctx.fillStyle=bg; rr(b.x,b.y,b.w,b.h,14); ctx.fill();
+  ctx.strokeStyle='rgba(0,0,0,0.25)'; ctx.lineWidth=2; ctx.stroke();
+  ctx.fillStyle=fg||'#fff'; ctx.font='bold 20px Trebuchet MS, sans-serif';
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillText(b.label, b.x+b.w/2, b.y+b.h/2+1);
+}
+function drawHeart(x,y,filled,s){
+  ctx.save(); ctx.translate(x,y); ctx.scale(s,s);
+  ctx.beginPath();
+  ctx.moveTo(0,6); ctx.bezierCurveTo(-11,-5,-6,-13,0,-6); ctx.bezierCurveTo(6,-13,11,-5,0,6);
+  ctx.fillStyle=filled?'#e5484d':'rgba(0,0,0,0.15)'; ctx.fill();
+  ctx.strokeStyle='rgba(0,0,0,0.3)'; ctx.lineWidth=1; ctx.stroke(); ctx.restore();
+}
+function drawStar(x,y,r,filled){
+  ctx.save(); ctx.translate(x,y); ctx.beginPath();
+  for(let i=0;i<10;i++){ const a=-Math.PI/2+i*Math.PI/5, rad=i%2?r*0.45:r;
+    ctx[i?'lineTo':'moveTo'](Math.cos(a)*rad,Math.sin(a)*rad); }
+  ctx.closePath(); ctx.fillStyle=filled?'#ffc93d':'rgba(0,0,0,0.15)'; ctx.fill();
+  ctx.strokeStyle='rgba(0,0,0,0.25)'; ctx.lineWidth=1; ctx.stroke(); ctx.restore();
+}
+function drawCustomer(o, x, y, s){
+  // original procedurally-drawn customer: round face, hair, eyes, smile
+  const rnd=mulberry(777+ G.level*13 + o.name.length);
+  const skin=['#f2c79b','#e8b07e','#c98d5f','#f7d7b0'][Math.floor(rnd()*4)];
+  const hairC=['#3a2a1e','#6b4a2f','#1e1e24','#8a5a2b','#4a3b52'][Math.floor(rnd()*5)];
+  const hairStyle=Math.floor(rnd()*3);
+  ctx.save(); ctx.translate(x,y); ctx.scale(s,s);
+  ctx.fillStyle=skin; ctx.beginPath(); ctx.arc(0,0,26,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle=hairC;
+  if(hairStyle===0){ ctx.beginPath(); ctx.arc(0,-6,26,Math.PI,0); ctx.fill(); ctx.fillRect(-26,-8,52,8); }
+  else if(hairStyle===1){ ctx.beginPath(); ctx.arc(0,-10,24,Math.PI*0.95,Math.PI*2.05); ctx.fill(); ctx.beginPath(); ctx.arc(-24,4,7,0,Math.PI*2); ctx.arc(24,4,7,0,Math.PI*2); ctx.fill(); }
+  else { ctx.beginPath(); ctx.arc(0,-14,20,Math.PI,0); ctx.fill(); ctx.beginPath(); ctx.arc(0,-30,10,0,Math.PI*2); ctx.fill(); }
+  ctx.fillStyle='#222';
+  ctx.beginPath(); ctx.arc(-9,2,3,0,Math.PI*2); ctx.arc(9,2,3,0,Math.PI*2); ctx.fill();
+  ctx.strokeStyle='#7a4a2b'; ctx.lineWidth=2; ctx.beginPath(); ctx.arc(0,8,9,0.15*Math.PI,0.85*Math.PI); ctx.stroke();
+  ctx.fillStyle='rgba(255,120,120,0.35)';
+  ctx.beginPath(); ctx.arc(-15,9,4,0,Math.PI*2); ctx.arc(15,9,4,0,Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+function drawShelfPots(){
+  const pots=[['#b85a30',60],['#4a7a5c',120],['#7a5a9a',190],['#c98a3f',255],['#3f6a8a',320],['#a34d28',390]];
+  ctx.fillStyle='#8a6a4a'; ctx.fillRect(14,96,452,10);
+  for(const [c,x] of pots){
+    ctx.fillStyle=c;
+    ctx.beginPath(); ctx.moveTo(x-16,96); ctx.quadraticCurveTo(x-20,66,x-8,62);
+    ctx.lineTo(x+8,62); ctx.quadraticCurveTo(x+20,66,x+16,96); ctx.closePath(); ctx.fill();
+    ctx.fillStyle='rgba(255,255,255,0.25)'; ctx.fillRect(x-12,68,5,22);
+  }
+}
+function clayPath(radii, mirror){
+  ctx.beginPath();
+  ctx.moveTo(CX - radii[0], BASE_Y);
+  for(let i=0;i<G.n;i++) ctx.lineTo(CX - radii[i], pointY(i));
+  ctx.lineTo(CX + radii[G.n-1], pointY(G.n-1));
+  for(let i=G.n-1;i>=0;i--) ctx.lineTo(CX + radii[i], pointY(i));
+  ctx.closePath();
+}
+function drawPlay(){
+  const o=ORDERS[G.level];
+  // wall + floor
+  ctx.fillStyle='#f7e8d0'; ctx.fillRect(0,0,W,560);
+  ctx.fillStyle='#e8cfa8'; ctx.fillRect(0,560,W,240);
+  ctx.fillStyle='#d9b98a'; ctx.fillRect(0,556,W,6);
+  drawShelfPots();
+  // customer + speech bubble
+  drawCustomer(o, 52, 168, 1);
+  ctx.fillStyle='#fff'; rr(92,128,340,66,12); ctx.fill();
+  ctx.strokeStyle='#d9b98a'; ctx.lineWidth=2; ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(92,160); ctx.lineTo(78,172); ctx.lineTo(94,178); ctx.closePath(); ctx.fill();
+  ctx.fillStyle='#3a2a1e'; ctx.font='bold 15px Trebuchet MS, sans-serif'; ctx.textAlign='left'; ctx.textBaseline='top';
+  ctx.fillText(o.name+' wants: '+o.item, 104, 136);
+  ctx.font='14px Trebuchet MS, sans-serif'; ctx.fillStyle='#5a4632';
+  wrapText(o.say, 104, 158, 316, 17);
+  // HUD
+  ctx.fillStyle='#3a2a1e'; ctx.font='bold 17px Trebuchet MS, sans-serif'; ctx.textAlign='left'; ctx.textBaseline='middle';
+  ctx.fillText('Order '+(G.level+1)+'/20', 16, 26);
+  ctx.fillStyle='#8a6a2f'; ctx.fillText('Coins: '+G.coins, 150, 26);
+  ctx.fillStyle='#3a2a1e'; ctx.fillText('Score: '+G.score, 268, 26);
+  for(let i=0;i<3;i++) drawHeart(400+i*26, 26, i<G.hearts, 1);
+  // timer bar
+  const tw=300, frac=G.timeLeft/G.timeMax;
+  ctx.fillStyle='rgba(0,0,0,0.15)'; rr(16,44,tw,10,5); ctx.fill();
+  ctx.fillStyle=frac>0.35?'#4a9a5c':(frac>0.15?'#e8a13d':'#e5484d');
+  rr(16,44,tw*frac,10,5); ctx.fill();
+  ctx.fillStyle='#3a2a1e'; ctx.font='13px Trebuchet MS, sans-serif'; ctx.textAlign='left';
+  ctx.fillText(Math.ceil(G.timeLeft)+'s', 324, 49);
+  // wheel + table
+  ctx.fillStyle='#6b4a2f'; ctx.beginPath(); ctx.ellipse(CX,662,190,26,0,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#8a6a4a'; ctx.beginPath(); ctx.ellipse(CX,656,190,24,0,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#a34d28'; ctx.beginPath(); ctx.ellipse(CX,652,150,18,0,0,Math.PI*2); ctx.fill();
+  // ghost target outline (dashed)
+  ctx.save(); ctx.setLineDash([8,6]); ctx.strokeStyle='rgba(58,42,30,0.55)'; ctx.lineWidth=2.5;
+  ctx.beginPath();
+  ctx.moveTo(CX-G.target[0], BASE_Y);
+  for(let i=0;i<G.n;i++) ctx.lineTo(CX-G.target[i], pointY(i));
+  for(let i=G.n-1;i>=0;i--) ctx.lineTo(CX+G.target[i], pointY(i));
+  ctx.closePath(); ctx.stroke(); ctx.restore();
+  ctx.fillStyle='rgba(58,42,30,0.6)'; ctx.font='bold 12px Trebuchet MS, sans-serif'; ctx.textAlign='center';
+  ctx.fillText('— dashed outline = target shape —', CX, 204);
+  // clay
+  ctx.save();
+  if(G.shake>0) ctx.translate((Math.random()-0.5)*G.shake,(Math.random()-0.5)*G.shake);
+  const grad=ctx.createLinearGradient(CX-MAXR,0,CX+MAXR,0);
+  grad.addColorStop(0,'#a34d28'); grad.addColorStop(0.35,CLAY_COLORS[G.level%4]);
+  grad.addColorStop(0.75,'#e09a62'); grad.addColorStop(1,'#8a3f1e');
+  clayPath(G.radii); ctx.fillStyle=grad; ctx.fill();
+  ctx.strokeStyle='rgba(60,25,10,0.5)'; ctx.lineWidth=2; ctx.stroke();
+  // wheel-thrown rings + highlight
+  ctx.strokeStyle='rgba(255,255,255,0.18)'; ctx.lineWidth=2;
+  for(let i=1;i<G.n-1;i++){ ctx.beginPath(); ctx.moveTo(CX-G.radii[i]+4,pointY(i)); ctx.lineTo(CX+G.radii[i]-4,pointY(i)); ctx.stroke(); }
+  ctx.fillStyle='rgba(255,255,255,0.22)';
+  ctx.beginPath(); ctx.ellipse(CX-52, (BASE_Y+TOP_Y)/2, 16, 150, 0.12, 0, Math.PI*2); ctx.fill();
+  // handles on right edge
+  for(let i=0;i<G.n;i++){
+    ctx.beginPath(); ctx.arc(CX+G.radii[i]+2, pointY(i), 6, 0, Math.PI*2);
+    ctx.fillStyle='#fff'; ctx.fill(); ctx.strokeStyle='#8a3f1e'; ctx.lineWidth=2; ctx.stroke();
+  }
+  ctx.restore();
+  // accuracy meter
+  ctx.fillStyle='#3a2a1e'; ctx.font='bold 16px Trebuchet MS, sans-serif'; ctx.textAlign='left';
+  ctx.fillText('Match: '+G.accuracy+'%  (need '+o.pass+'%)', 16, 712);
+  ctx.fillStyle='rgba(0,0,0,0.15)'; rr(16,724,448,16,8); ctx.fill();
+  ctx.fillStyle=G.accuracy>=o.pass?'#4a9a5c':'#e8a13d'; rr(16,724,448*G.accuracy/100,16,8); ctx.fill();
+  ctx.fillStyle='#3a2a1e'; ctx.font='13px Trebuchet MS, sans-serif';
+  ctx.fillText('Tip: '+o.tip, 16, 762);
+  // sparkles
+  for(const s of G.sparkles){
+    ctx.globalAlpha=Math.max(0,s.life); ctx.fillStyle=s.c;
+    ctx.beginPath(); ctx.arc(s.x,s.y,s.s,0,Math.PI*2); ctx.fill();
+  }
+  ctx.globalAlpha=1;
+  if(G.flash>0){
+    ctx.globalAlpha=G.flash; ctx.fillStyle='#3a2a1e'; ctx.font='bold 30px Trebuchet MS, sans-serif'; ctx.textAlign='center';
+    ctx.fillText(G.flashText, CX, 420); ctx.globalAlpha=1;
+  }
+}
+function wrapText(text,x,y,maxW,lh){
+  const words=text.split(' '); let line='', yy=y;
+  for(const w of words){
+    const t=line?line+' '+w:w;
+    if(ctx.measureText(t).width>maxW && line){ ctx.fillText(line,x,yy); line=w; yy+=lh; }
+    else line=t;
+  }
+  ctx.fillText(line,x,yy);
+}
+function drawMenu(){
+  ctx.fillStyle='#f7e8d0'; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle='#e8cfa8'; ctx.fillRect(0,560,W,240);
+  drawShelfPots();
+  // big clay pot logo
+  ctx.save(); ctx.translate(CX,330);
+  const grad=ctx.createLinearGradient(-90,0,90,0);
+  grad.addColorStop(0,'#a34d28'); grad.addColorStop(0.5,'#d98a52'); grad.addColorStop(1,'#8a3f1e');
+  ctx.fillStyle=grad; ctx.beginPath();
+  ctx.moveTo(-58,110); ctx.quadraticCurveTo(-95,40,-70,-30); ctx.quadraticCurveTo(-60,-70,-38,-80);
+  ctx.lineTo(38,-80); ctx.quadraticCurveTo(60,-70,70,-30); ctx.quadraticCurveTo(95,40,58,110); ctx.closePath(); ctx.fill();
+  ctx.strokeStyle='rgba(60,25,10,0.5)'; ctx.lineWidth=3; ctx.stroke();
+  ctx.fillStyle='rgba(255,255,255,0.25)'; ctx.beginPath(); ctx.ellipse(-38,10,12,55,0.15,0,Math.PI*2); ctx.fill();
+  ctx.restore();
+  ctx.fillStyle='#3a2a1e'; ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.font='bold 44px Trebuchet MS, sans-serif';
+  ctx.fillText('CLAY SHAPER', CX, 130);
+  ctx.font='bold 24px Trebuchet MS, sans-serif'; ctx.fillStyle='#b85a30';
+  ctx.fillText('Pottery Studio', CX, 168);
+  ctx.font='15px Trebuchet MS, sans-serif'; ctx.fillStyle='#5a4632';
+  ctx.fillText('Shape clay on the wheel. Match the target.', CX, 480);
+  ctx.fillText('Serve 20 customers. Earn coins. Don\'t run', CX, 502);
+  ctx.fillText('out of hearts — or patience!', CX, 524);
+  ctx.fillStyle='#8a6a2f'; ctx.font='bold 16px Trebuchet MS, sans-serif';
+  ctx.fillText('Best score: '+G.score+'   •   Coins: '+G.coins, CX, 560);
+}
+function drawHowTo(){
+  ctx.fillStyle='rgba(43,29,22,0.92)'; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle='#fff8ec'; rr(30,90,420,560,18); ctx.fill();
+  ctx.fillStyle='#3a2a1e'; ctx.textAlign='left'; ctx.textBaseline='top';
+  ctx.font='bold 26px Trebuchet MS, sans-serif'; ctx.fillText('How to Play', 56, 116);
+  ctx.font='16px Trebuchet MS, sans-serif'; ctx.fillStyle='#5a4632';
+  const lines=[
+    '1. A customer orders a pot. The dashed',
+    '    outline shows the shape they want.',
+    '2. DRAG on the clay: drag left to pinch',
+    '    it in, right to push it out. The clay',
+    '    near your finger moves most.',
+    '3. Watch the Match % meter. When it is',
+    '    at or above the target, tap FIRE IT!',
+    '4. Better matches earn more coins and',
+    '    stars. Below the target, you lose a',
+    '    heart — lose 3 hearts and the day',
+    '    ends. Beat the timer, too!',
+    '5. Later customers want trickier shapes',
+    '    with wavy rims and tighter targets.',
+    '',
+    'Pause and mute are at the top of the',
+    'screen while you play. Good luck, potter!',
+  ];
+  let y=158; for(const l of lines){ ctx.fillText(l,56,y); y+=24; }
+}
+function drawPaused(){
+  drawPlay();
+  ctx.fillStyle='rgba(43,29,22,0.75)'; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle='#3a2a1e'; ctx.font='bold 38px Trebuchet MS, sans-serif'; ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillText('PAUSED', CX, 300);
+  ctx.font='16px Trebuchet MS, sans-serif'; ctx.fillStyle='#f7e8d0';
+  ctx.fillText('Take a breath. The clay will wait.', CX, 340);
+}
+function drawLevelDone(){
+  drawPlay();
+  ctx.fillStyle='rgba(43,29,22,0.7)'; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle='#fff8ec'; rr(50,220,380,340,18); ctx.fill();
+  const r=G.result;
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  if(r.passed){
+    ctx.fillStyle='#4a9a5c'; ctx.font='bold 30px Trebuchet MS, sans-serif';
+    ctx.fillText('Order Complete!', CX, 268);
+    for(let i=0;i<3;i++) drawStar(190+i*50, 318, 20, i<r.stars);
+    ctx.fillStyle='#3a2a1e'; ctx.font='18px Trebuchet MS, sans-serif';
+    ctx.fillText('Match: '+r.acc+'%', CX, 362);
+    ctx.fillStyle='#8a6a2f'; ctx.font='bold 20px Trebuchet MS, sans-serif';
+    ctx.fillText('+'+r.earned+' coins', CX, 396);
+    ctx.fillStyle='#5a4632'; ctx.font='15px Trebuchet MS, sans-serif';
+    ctx.fillText(ORDERS[G.level].name+' loves it!', CX, 430);
+  }else{
+    ctx.fillStyle='#e5484d'; ctx.font='bold 30px Trebuchet MS, sans-serif';
+    ctx.fillText('Not Quite Right', CX, 268);
+    ctx.fillStyle='#3a2a1e'; ctx.font='18px Trebuchet MS, sans-serif';
+    ctx.fillText('Match: '+r.acc+'%  (needed '+ORDERS[G.level].pass+'%)', CX, 318);
+    ctx.fillStyle='#5a4632'; ctx.font='15px Trebuchet MS, sans-serif';
+    ctx.fillText(ORDERS[G.level].name+' shakes their head.', CX, 356);
+    ctx.fillText('You lost a heart. Try again!', CX, 382);
+    ctx.fillStyle='#e5484d'; ctx.font='bold 18px Trebuchet MS, sans-serif';
+    ctx.fillText('Hearts left: '+G.hearts, CX, 420);
+  }
+}
+function drawGameOver(){
+  ctx.fillStyle='#2b1d16'; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle='#f7e8d0'; ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.font='bold 38px Trebuchet MS, sans-serif';
+  ctx.fillText('Day Over!', CX, 240);
+  ctx.font='18px Trebuchet MS, sans-serif'; ctx.fillStyle='#e8cfa8';
+  ctx.fillText('Three customers walked away unhappy.', CX, 300);
+  ctx.fillText('The studio closes early today…', CX, 330);
+  ctx.fillStyle='#fff'; ctx.font='bold 22px Trebuchet MS, sans-serif';
+  ctx.fillText('Orders served: '+G.level+' / 20', CX, 400);
+  ctx.fillText('Coins earned: '+G.coins, CX, 434);
+  ctx.fillText('Score: '+G.score, CX, 468);
+}
+function drawWin(){
+  ctx.fillStyle='#f7e8d0'; ctx.fillRect(0,0,W,H);
+  drawShelfPots();
+  ctx.fillStyle='#3a2a1e'; ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.font='bold 36px Trebuchet MS, sans-serif';
+  ctx.fillText('MASTER POTTER!', CX, 200);
+  ctx.font='18px Trebuchet MS, sans-serif'; ctx.fillStyle='#5a4632';
+  ctx.fillText('All 20 customers served. The studio', CX, 250);
+  ctx.fillText('is famous across the whole town!', CX, 276);
+  for(let i=0;i<3;i++) drawStar(190+i*50, 330, 22, true);
+  ctx.fillStyle='#8a6a2f'; ctx.font='bold 22px Trebuchet MS, sans-serif';
+  ctx.fillText('Total coins: '+G.coins, CX, 390);
+  ctx.fillStyle='#3a2a1e';
+  ctx.fillText('Final score: '+G.score, CX, 424);
+  ctx.font='16px Trebuchet MS, sans-serif'; ctx.fillStyle='#5a4632';
+  ctx.fillText('Stars earned: '+G.stars.reduce((a,b)=>a+(b||0),0)+' / 60', CX, 458);
+}
+
+/* ---------------- render + buttons per screen ---------------- */
+function render(){
+  BUTTONS=[];
+  ctx.clearRect(0,0,W,H);
+  ctx.textBaseline='alphabetic';
+  if(G.screen==='menu'){
+    drawMenu();
+    btn(140,590,200,54,'▶  Play', ()=>{ AudioSys.init(); AudioSys.resume(); AudioSys.startMusic(); restartGame(); });
+    btn(140,656,200,54,'How to Play', ()=>{ G.screen='howto'; });
+    drawButton(BUTTONS[0],'#b85a30'); drawButton(BUTTONS[1],'#4a7a5c');
+  }else if(G.screen==='howto'){
+    drawHowTo();
+    btn(140,586,200,54,'Got It!', ()=>{ G.screen='menu'; });
+    drawButton(BUTTONS[0],'#b85a30');
+  }else if(G.screen==='play' || G.screen==='paused'){
+    if(G.screen==='paused') drawPaused(); else drawPlay();
+    // top-right small buttons
+    const pb=btn(428,8,44,34, G.screen==='paused'?'▶':'❚❚', ()=>{ G.screen = G.screen==='paused'?'play':'paused'; });
+    const mb=btn(380,8,44,34, AudioSys.muted?'🔇':'♪', ()=>{ AudioSys.init(); AudioSys.toggleMute(); });
+    // Fire button (only while playing)
+    if(G.screen==='play'){
+      const fb=btn(330,686,134,52,'🔥 Fire It!', submitPot);
+      drawButton(fb, G.accuracy>=ORDERS[G.level].pass?'#4a9a5c':'#b85a30');
+    }
+    drawButton(pb,'rgba(255,248,236,0.9)','#3a2a1e');
+    drawButton(mb,'rgba(255,248,236,0.9)','#3a2a1e');
+  }else if(G.screen==='leveldone'){
+    drawLevelDone();
+    if(G.result && G.result.passed){
+      btn(140,496,200,54, G.level+1>=ORDERS.length?'See Results':'Next Customer ▶', nextLevel);
+    }else{
+      btn(140,496,200,54,'Try Again', retryLevel);
+    }
+    drawButton(BUTTONS[0],'#b85a30');
+  }else if(G.screen==='gameover'){
+    drawGameOver();
+    btn(140,540,200,54,'Try Again', restartGame);
+    btn(140,606,200,54,'Main Menu', ()=>{ G.screen='menu'; });
+    drawButton(BUTTONS[0],'#b85a30'); drawButton(BUTTONS[1],'#4a7a5c');
+  }else if(G.screen==='win'){
+    drawWin();
+    btn(140,540,200,54,'Play Again', restartGame);
+    btn(140,606,200,54,'Main Menu', ()=>{ G.screen='menu'; });
+    drawButton(BUTTONS[0],'#b85a30'); drawButton(BUTTONS[1],'#4a7a5c');
+  }
+}
+
+/* ---------------- main loop ---------------- */
+let lastT=performance.now();
+let lastFrame=performance.now();
+function loop(now){
+  const dt=Math.min(0.1,(now-lastT)/1000); lastT=now; lastFrame=now;
+  if(G.screen==='play' && !G.dragging || G.screen==='play'){
+    if(G.screen==='play'){
+      G.timeLeft-=dt;
+      if(G.timeLeft<=0){
+        G.timeLeft=0;
+        G.hearts--;
+        G.result={acc:computeAccuracy(),stars:0,earned:0,passed:false,timeout:true};
+        AudioSys.fail(); G.shake=12;
+        G.screen = G.hearts<=0 ? 'gameover' : 'leveldone';
+      }
+    }
+  }
+  if(G.flash>0) G.flash=Math.max(0,G.flash-dt*1.5);
+  if(G.shake>0) G.shake=Math.max(0,G.shake-dt*30);
+  for(const s of G.sparkles){ s.x+=s.vx; s.y+=s.vy; s.vy+=0.06; s.life-=dt*0.9; }
+  G.sparkles=G.sparkles.filter(s=>s.life>0);
+  render();
+  requestAnimationFrame(loop);
+}
+// Watchdog: headless / backgrounded environments can throttle rAF to
+// ~0.3 fps (or stall it), leaving stale hit-targets for seconds. If no
+// frame ran in the last 250 ms, redraw directly so buttons, the timer bar
+// and the accuracy meter stay live. On a normal 60 fps device this never
+// fires, so it costs nothing in real play.
+setInterval(()=>{ if(performance.now()-lastFrame>250) render(); }, 200);
+function resize(){
+  const scale=Math.min(window.innerWidth/W, window.innerHeight/H);
+  cv.style.width=(W*scale)+'px'; cv.style.height=(H*scale)+'px';
+}
+window.addEventListener('resize', resize);
+resize();
+requestAnimationFrame(loop);
+
+/* ---------------- test/debug hooks (not part of gameplay) ---------------- */
+window.__clay = {
+  state(){ return {screen:G.screen, level:G.level+1, n:G.n, item:ORDERS[G.level]?ORDERS[G.level].item:null,
+    accuracy:G.accuracy, coins:G.coins, score:G.score, hearts:G.hearts,
+    stars:G.stars.slice(), timeLeft:Math.round(G.timeLeft), pass:ORDERS[G.level]?ORDERS[G.level].pass:null,
+    radii:G.radii.map(v=>Math.round(v)), target:G.target.map(v=>Math.round(v))}; },
+  pointScreen(i){ const r=cv.getBoundingClientRect();
+    return {x:r.left+(CX+G.radii[i])*(r.width/W), y:r.top+pointY(i)*(r.height/H)}; },
+  clayCenter(){ const r=cv.getBoundingClientRect();
+    return {x:r.left+CX*(r.width/W), y:r.top+((BASE_Y+TOP_Y)/2)*(r.height/H)}; },
+  button(label){ const b=BUTTONS.find(b=>b.label.indexOf(label)>=0); if(!b) return null;
+    const r=cv.getBoundingClientRect();
+    return {x:r.left+(b.x+b.w/2)*(r.width/W), y:r.top+(b.y+b.h/2)*(r.height/H)}; },
+  setRadiiToTarget(){ G.radii=G.target.slice(); G.accuracy=computeAccuracy(); },
+  start(){ if(G.screen==='menu') restartGame(); }
+};
+</script>
+</body>
+</html>
